@@ -1,0 +1,13 @@
+name: win-check
+on: { push: { branches: ["**win-check**"] }, workflow_dispatch: {} }
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults: { run: { working-directory: codex-rs } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable   # или версия из codex-rs/rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: codex-rs }
+      - run: cargo check -p codex-windows-sandbox -p codex-core -p codex-exec -p codex-cli --all-targets
+      - run: cargo test -p codex-windows-sandbox
