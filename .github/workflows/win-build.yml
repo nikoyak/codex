@@ -1,0 +1,61 @@
+name: win-build
+on:
+  push:
+    branches: ["**win-build**"]
+  workflow_dispatch: {}
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_HOME: C:\cargo
+  RUSTY_V8_MIRROR: https://github.com/openai/codex/releases/download
+  RUSTY_V8_MIRROR_TAG: rusty-v8-v152.2.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: codex-rs
+        shell: bash
+    steps:
+      - run: git config --system core.longpaths true
+        working-directory: .
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+
+      - name: Build sandbox binaries
+        run: >
+          cargo build --release
+          --bin codex-windows-sandbox-setup
+          --bin codex-windows-sandbox-service
+          --bin codex-command-runner
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-binaries
+          path: |
+            codex-rs/target/release/codex-windows-sandbox-setup.exe
+            codex-rs/target/release/codex-windows-sandbox-service.exe
+            codex-rs/target/release/codex-command-runner.exe
+
+      - name: Build main binaries
+        run: >
+          cargo build --release
+          --bin codex
+          --bin codex-code-mode-host
+          --bin codex-exec-server
+          --bin codex-responses-api-proxy
+          --bin codex-app-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-binaries
+          path: |
+            codex-rs/target/release/codex.exe
+            codex-rs/target/release/codex-code-mode-host.exe
+            codex-rs/target/release/codex-exec-server.exe
+            codex-rs/target/release/codex-responses-api-proxy.exe
+            codex-rs/target/release/codex-app-server.exe

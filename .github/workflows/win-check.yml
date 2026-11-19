@@ -1,0 +1,17 @@
+name: win-check
+on: { push: { branches: ["**win-check**"] }, workflow_dispatch: {} }
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_HOME: C:\cargo
+jobs:
+  check:
+    runs-on: windows-latest
+    defaults: { run: { working-directory: codex-rs } }
+    steps:
+      - run: git config --system core.longpaths true
+        working-directory: .
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable   # версию взять из codex-rs/rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: codex-rs }
+      - run: cargo check -p codex-windows-sandbox --all-targets
