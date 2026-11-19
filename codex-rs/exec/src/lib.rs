@@ -276,6 +276,8 @@ fn exec_stderr_env_filter() -> EnvFilter {
 }
 
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
+    // Nobody is present to answer a UAC prompt in a non-interactive run.
+    codex_core::windows_sandbox::disable_elevation_prompts();
     if let Some(endpoint) = codex_app_server_client::resolve_remote_endpoint(
         cli.remote.clone(),
         cli.remote_auth_token_env.clone(),

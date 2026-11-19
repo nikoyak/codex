@@ -11,6 +11,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -50,6 +52,26 @@ use windows_sys::Win32::Security::FreeSid;
 use windows_sys::Win32::Security::SECURITY_NT_AUTHORITY;
 
 pub const SETUP_VERSION: u32 = 5;
+
+/// Environment switch with the same effect as [`disable_elevation_prompts`], for hosts that
+/// cannot call it (set to any value other than empty or `0`).
+const NO_ELEVATION_PROMPT_ENV: &str = "CODEX_WINDOWS_SANDBOX_NO_ELEVATION_PROMPT";
+static ELEVATION_PROMPTS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Makes sandbox setup that needs administrator approval fail with
+/// `SetupErrorCode::OrchestratorElevationRequired` instead of raising a UAC prompt.
+///
+/// Intended for non-interactive runs such as `codex exec`: a prompt there lands on whatever
+/// desktop is logged in, once per command, and nobody is present to answer it.
+pub fn disable_elevation_prompts() {
+    ELEVATION_PROMPTS_DISABLED.store(true, Ordering::Relaxed);
+}
+
+fn elevation_prompts_disabled() -> bool {
+    ELEVATION_PROMPTS_DISABLED.load(Ordering::Relaxed)
+        || std::env::var_os(NO_ELEVATION_PROMPT_ENV)
+            .is_some_and(|value| !value.is_empty() && value != "0")
+}
 pub const OFFLINE_USERNAME: &str = "CodexSandboxOffline";
 pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
 const ERROR_CANCELLED: u32 = 1223;
@@ -346,10 +368,12 @@ fn run_setup_refresh_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+    // A refresh never creates accounts, so it must target the ones this home recorded.
+    let account_names = crate::identity::resolve_account_names(request.codex_home);
     let payload = ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        offline_username: account_names.offline,
+        online_username: account_names.online,
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.command_cwd.to_path_buf(),
         read_roots,
@@ -1028,6 +1052,13 @@ fn run_setup_exe_payload(
         return Ok(());
     }
 
+    if elevation_prompts_disabled() {
+        return Err(failure(
+            SetupErrorCode::OrchestratorElevationRequired,
+            "sandbox setup needs administrator approval, but elevation prompts are disabled for \
+             this non-interactive run; run `codex sandbox windows setup` from an elevated shell",
+        ));
+    }
     let exe_w = crate::winutil::to_wide(&exe);
     let params = quote_arg(payload_b64);
     let params_w = crate::winutil::to_wide(params);
@@ -1158,10 +1189,13 @@ fn elevated_provisioning_payload(
 ) -> ElevationPayload {
     let offline_proxy_settings =
         offline_proxy_settings_for_request(request, offline_proxy_settings_override);
+    // Full setup gives every home its own accounts so that rotating one home's
+    // passwords cannot invalidate another home's recorded credentials.
+    let account_names = crate::account_names::SandboxAccountNames::derived(request.codex_home);
     ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        offline_username: account_names.offline,
+        online_username: account_names.online,
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.codex_home.to_path_buf(),
         read_roots: Vec::new(),
@@ -1239,10 +1273,16 @@ pub fn run_elevated_provisioning_setup_with_retained_handles(
             "sandbox provisioning setup must be run from an elevated process",
         ));
     }
+    // Registered Core accounts are owned by the single-owner service record and are
+    // matched against the fixed names; only the helper-based runtime is per-home.
+    let account_names = match runtime {
+        SetupRuntime::Registered => crate::account_names::SandboxAccountNames::legacy(),
+        SetupRuntime::Legacy => crate::account_names::SandboxAccountNames::derived(codex_home),
+    };
     let payload = ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        offline_username: account_names.offline,
+        online_username: account_names.online,
         codex_home: codex_home.to_path_buf(),
         command_cwd: codex_home.to_path_buf(),
         read_roots: Vec::new(),

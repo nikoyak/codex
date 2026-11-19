@@ -58,6 +58,8 @@ pub struct WindowsSandboxProvisioningSettings {
 }
 
 #[cfg(target_os = "windows")]
+mod account_names;
+#[cfg(target_os = "windows")]
 mod acl;
 #[cfg(target_os = "windows")]
 mod allow;
@@ -297,6 +299,8 @@ pub use identity::logon_existing_sandbox_account;
 #[cfg(target_os = "windows")]
 pub use identity::require_logon_sandbox_creds;
 #[cfg(target_os = "windows")]
+pub use identity::sandbox_account_usernames;
+#[cfg(target_os = "windows")]
 pub use identity::sandbox_setup_is_complete;
 #[cfg(target_os = "windows")]
 pub use identity::sandbox_setup_is_complete_with_settings;
@@ -428,6 +432,8 @@ pub use setup::SandboxSetupRequest;
 pub use setup::SetupRootOverrides;
 #[cfg(target_os = "windows")]
 pub use setup::SetupRuntime;
+#[cfg(target_os = "windows")]
+pub use setup::disable_elevation_prompts;
 #[cfg(target_os = "windows")]
 pub use setup::run_elevated_provisioning_setup;
 #[cfg(target_os = "windows")]

@@ -38,12 +38,10 @@ use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 
-use crate::SANDBOX_USERS_GROUP;
 use crate::SETUP_VERSION;
 use crate::SetupErrorCode;
 use crate::SetupFailure;
 use crate::dpapi_protect;
-use crate::ensure_sandbox_users_group;
 use crate::resolve_sid;
 use crate::sandbox_dir;
 use crate::sandbox_secrets_dir;
@@ -59,8 +57,8 @@ mod tests;
 
 const SID_USERS: &str = "S-1-5-32-545";
 
-pub fn resolve_sandbox_users_group_sid() -> Result<Vec<u8>> {
-    resolve_sid(SANDBOX_USERS_GROUP)
+pub fn resolve_sandbox_users_group_sid(group: &str) -> Result<Vec<u8>> {
+    resolve_sid(group)
 }
 
 pub(super) fn provision_sandbox_users(
@@ -71,8 +69,9 @@ pub(super) fn provision_sandbox_users(
     log: &mut dyn Write,
     mode: SetupMode,
 ) -> Result<()> {
-    if let Err(err) = ensure_sandbox_users_group() {
-        let message = format!("failed to create local group {SANDBOX_USERS_GROUP}: {err}");
+    let group = crate::account_names::group_name_for_offline_username(offline_username);
+    if let Err(err) = crate::winutil::ensure_local_group(&group) {
+        let message = format!("failed to create local group {group}: {err}");
         super::log_line(log, &message)?;
         return Err(anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperUsersGroupCreateFailed,
@@ -85,8 +84,20 @@ pub(super) fn provision_sandbox_users(
     )?;
     let offline_password = random_password();
     let online_password = random_password();
-    ensure_sandbox_user(offline_username, &offline_password, new_user_flags, log)?;
-    ensure_sandbox_user(online_username, &online_password, new_user_flags, log)?;
+    ensure_sandbox_user(
+        offline_username,
+        &offline_password,
+        &group,
+        new_user_flags,
+        log,
+    )?;
+    ensure_sandbox_user(
+        online_username,
+        &online_password,
+        &group,
+        new_user_flags,
+        log,
+    )?;
     write_secrets(
         codex_home,
         offline_username,
@@ -101,11 +112,12 @@ pub(super) fn provision_sandbox_users(
 pub fn ensure_sandbox_user(
     username: &str,
     password: &str,
+    group: &str,
     new_user_flags: u32,
     log: &mut dyn Write,
 ) -> Result<()> {
     ensure_local_user(username, password, new_user_flags, log)?;
-    ensure_local_group_member(SANDBOX_USERS_GROUP, username)?;
+    ensure_local_group_member(group, username)?;
     Ok(())
 }
 

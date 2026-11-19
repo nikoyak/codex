@@ -172,6 +172,16 @@ pub fn legacy_windows_sandbox_mode_from_entries(
     }
 }
 
+/// Non-interactive callers must not raise UAC prompts from sandbox setup; setup that needs
+/// administrator approval then fails with a typed error instead.
+#[cfg(target_os = "windows")]
+pub fn disable_elevation_prompts() {
+    codex_windows_sandbox::disable_elevation_prompts();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn disable_elevation_prompts() {}
+
 #[cfg(target_os = "windows")]
 pub fn sandbox_setup_is_complete(codex_home: &Path) -> bool {
     codex_windows_sandbox::sandbox_setup_is_complete(codex_home)

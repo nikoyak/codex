@@ -29,6 +29,7 @@ use windows::core::Interface;
 
 use crate::SetupErrorCode;
 use crate::SetupFailure;
+use crate::account_names::scoped_rule_name;
 
 // This is the stable identifier we use to find/update the rule idempotently.
 // It intentionally does not change between installs.
@@ -87,13 +88,30 @@ impl Drop for FirewallComApartment {
     }
 }
 
+/// Firewall rules are matched by name and updated in place, so every offline account needs
+/// its own names; sharing them would let one home overwrite another home's user scope.
+fn scoped_friendly_name(base: &str, rule_tag: Option<&str>) -> String {
+    match rule_tag {
+        Some(tag) => format!("{base} [{tag}]"),
+        None => base.to_string(),
+    }
+}
+
 pub fn ensure_offline_proxy_allowlist(
     offline_sid: &str,
+    rule_tag: Option<&str>,
     proxy_ports: &[u16],
     allow_local_binding: bool,
     log: &mut dyn Write,
 ) -> Result<()> {
     let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
+    let proxy_allow_name = scoped_rule_name(OFFLINE_PROXY_ALLOW_RULE_NAME, rule_tag);
+    let loopback_udp_name = scoped_rule_name(OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME, rule_tag);
+    let loopback_tcp_name = scoped_rule_name(OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME, rule_tag);
+    let loopback_udp_friendly =
+        scoped_friendly_name(OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY, rule_tag);
+    let loopback_tcp_friendly =
+        scoped_friendly_name(OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY, rule_tag);
 
     let _apartment = FirewallComApartment::initialize()?;
 
@@ -117,17 +135,17 @@ pub fn ensure_offline_proxy_allowlist(
             if allow_local_binding {
                 // Remove the legacy overlapping allow rule before returning to the local-binding
                 // mode so stale proxy exceptions do not linger.
-                remove_rule_if_present(&rules, OFFLINE_PROXY_ALLOW_RULE_NAME, log)?;
-                remove_rule_if_present(&rules, OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME, log)?;
-                remove_rule_if_present(&rules, OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME, log)?;
+                remove_rule_if_present(&rules, &proxy_allow_name, log)?;
+                remove_rule_if_present(&rules, &loopback_udp_name, log)?;
+                remove_rule_if_present(&rules, &loopback_tcp_name, log)?;
                 return Ok(());
             }
 
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
+                    internal_name: &loopback_udp_name,
+                    friendly_desc: &loopback_udp_friendly,
                     direction: NET_FW_RULE_DIR_OUT,
                     protocol: NET_FW_IP_PROTOCOL_UDP.0,
                     local_user_spec: &local_user_spec,
@@ -143,8 +161,8 @@ pub fn ensure_offline_proxy_allowlist(
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                    internal_name: &loopback_tcp_name,
+                    friendly_desc: &loopback_tcp_friendly,
                     direction: NET_FW_RULE_DIR_OUT,
                     protocol: NET_FW_IP_PROTOCOL_TCP.0,
                     local_user_spec: &local_user_spec,
@@ -157,14 +175,14 @@ pub fn ensure_offline_proxy_allowlist(
 
             // Remove the legacy overlapping allow rule only after the explicit block rules are in
             // place so transitions back to proxy-only mode do not fail open.
-            remove_rule_if_present(&rules, OFFLINE_PROXY_ALLOW_RULE_NAME, log)?;
+            remove_rule_if_present(&rules, &proxy_allow_name, log)?;
 
             if let Some(blocked_remote_ports) = blocked_loopback_tcp_remote_ports(proxy_ports) {
                 ensure_block_rule(
                     &rules,
                     &BlockRuleSpec {
-                        internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
-                        friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                        internal_name: &loopback_tcp_name,
+                        friendly_desc: &loopback_tcp_friendly,
                         direction: NET_FW_RULE_DIR_OUT,
                         protocol: NET_FW_IP_PROTOCOL_TCP.0,
                         local_user_spec: &local_user_spec,
@@ -180,8 +198,16 @@ pub fn ensure_offline_proxy_allowlist(
     }
 }
 
-pub fn ensure_offline_network_blocks(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
+pub fn ensure_offline_network_blocks(
+    offline_sid: &str,
+    rule_tag: Option<&str>,
+    log: &mut dyn Write,
+) -> Result<()> {
     let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
+    let outbound_name = scoped_rule_name(OFFLINE_BLOCK_RULE_NAME, rule_tag);
+    let inbound_name = scoped_rule_name(OFFLINE_BLOCK_INBOUND_RULE_NAME, rule_tag);
+    let outbound_friendly = scoped_friendly_name(OFFLINE_BLOCK_RULE_FRIENDLY, rule_tag);
+    let inbound_friendly = scoped_friendly_name(OFFLINE_BLOCK_INBOUND_RULE_FRIENDLY, rule_tag);
 
     let _apartment = FirewallComApartment::initialize()?;
 
@@ -206,8 +232,8 @@ pub fn ensure_offline_network_blocks(offline_sid: &str, log: &mut dyn Write) -> 
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
+                    internal_name: &outbound_name,
+                    friendly_desc: &outbound_friendly,
                     direction: NET_FW_RULE_DIR_OUT,
                     protocol: NET_FW_IP_PROTOCOL_ANY.0,
                     local_user_spec: &local_user_spec,
@@ -220,8 +246,8 @@ pub fn ensure_offline_network_blocks(offline_sid: &str, log: &mut dyn Write) -> 
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_INBOUND_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_INBOUND_RULE_FRIENDLY,
+                    internal_name: &inbound_name,
+                    friendly_desc: &inbound_friendly,
                     direction: NET_FW_RULE_DIR_IN,
                     protocol: NET_FW_IP_PROTOCOL_ANY.0,
                     local_user_spec: &local_user_spec,

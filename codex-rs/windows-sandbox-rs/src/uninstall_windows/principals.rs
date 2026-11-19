@@ -7,13 +7,16 @@ use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::NetworkManagement::NetManagement as network;
 use windows_sys::Win32::System::Registry as registry;
 use windows_sys::Win32::UI::Shell::DeleteProfileW;
 
+use crate::account_names;
 use crate::setup::OFFLINE_USERNAME;
 use crate::setup::ONLINE_USERNAME;
+use crate::winutil::SANDBOX_USERS_GROUP;
 use crate::winutil::local_user_flags;
 use crate::winutil::resolve_sid;
 use crate::winutil::set_local_user_flags;
@@ -28,27 +31,44 @@ pub(super) struct DisabledSandboxUsers {
 }
 
 struct SandboxUser {
-    name: &'static str,
+    name: String,
     original_flags: u32,
     sid: Vec<u8>,
 }
 
 impl DisabledSandboxUsers {
     pub(super) fn disable(&mut self) -> Result<()> {
-        for name in [OFFLINE_USERNAME, ONLINE_USERNAME] {
-            let Some(original_flags) = local_user_flags(name)? else {
+        for name in managed_user_names()? {
+            let Some(original_flags) = local_user_flags(&name)? else {
                 continue;
             };
-            let sid = resolve_sid(name)?;
+            let sid = resolve_sid(&name)?;
 
+            // Record the account first so a failed flag change is still restored.
             self.users.push(SandboxUser {
-                name,
+                name: name.clone(),
                 original_flags,
                 sid,
             });
-            set_local_user_flags(name, original_flags | network::UF_ACCOUNTDISABLE)?;
+            set_local_user_flags(&name, original_flags | network::UF_ACCOUNTDISABLE)?;
         }
         Ok(())
+    }
+
+    pub(super) fn names(&self) -> impl Iterator<Item = &str> {
+        self.users.iter().map(|user| user.name.as_str())
+    }
+
+    /// Tags of the per-home accounts, which namespace their firewall rules and WFP filters.
+    pub(super) fn derived_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self
+            .names()
+            .filter_map(account_names::tag_of_derived_account)
+            .map(str::to_string)
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
     }
 
     pub(super) fn sids(&self) -> impl Iterator<Item = &[u8]> {
@@ -56,13 +76,13 @@ impl DisabledSandboxUsers {
     }
 
     pub(super) fn validate_current(&self) -> Result<()> {
-        for name in [OFFLINE_USERNAME, ONLINE_USERNAME] {
-            let Some(flags) = local_user_flags(name)? else {
+        for name in managed_user_names()? {
+            let Some(flags) = local_user_flags(&name)? else {
                 continue;
             };
             let captured = self.users.iter().find(|user| user.name == name);
             ensure!(
-                captured.is_some_and(|user| resolve_sid(name).is_ok_and(|sid| sid == user.sid))
+                captured.is_some_and(|user| resolve_sid(&name).is_ok_and(|sid| sid == user.sid))
                     && flags & network::UF_ACCOUNTDISABLE != 0,
                 "sandbox account changed after being disabled: {name}"
             );
@@ -73,7 +93,7 @@ impl DisabledSandboxUsers {
     pub(super) fn restore(&self) -> Result<()> {
         let mut errors = Vec::new();
         for user in &self.users {
-            if let Err(error) = set_local_user_flags(user.name, user.original_flags)
+            if let Err(error) = set_local_user_flags(&user.name, user.original_flags)
                 && error
                     .downcast_ref::<std::io::Error>()
                     .and_then(std::io::Error::raw_os_error)
@@ -159,7 +179,7 @@ impl DisabledSandboxUsers {
     pub(super) fn for_token_test(sid: Vec<u8>) -> Self {
         Self {
             users: vec![SandboxUser {
-                name: OFFLINE_USERNAME,
+                name: OFFLINE_USERNAME.to_string(),
                 original_flags: network::UF_ACCOUNTDISABLE,
                 sid,
             }],
@@ -169,7 +189,7 @@ impl DisabledSandboxUsers {
 
 pub(super) fn remove_sandbox_principal(name: &str) -> Result<()> {
     let name_wide = to_wide(name);
-    let status = if name == "CodexSandboxUsers" {
+    let status = if name == SANDBOX_USERS_GROUP || account_names::is_derived_group(name) {
         unsafe { network::NetLocalGroupDel(null(), name_wide.as_ptr()) }
     } else {
         unsafe { network::NetUserDel(null(), name_wide.as_ptr()) }
@@ -178,6 +198,105 @@ pub(super) fn remove_sandbox_principal(name: &str) -> Result<()> {
         network::NERR_Success | network::NERR_GroupNotFound | network::NERR_UserNotFound => Ok(()),
         status => bail!("remove local sandbox principal {name}: {status}"),
     }
+}
+
+/// Every sandbox account Codex may have created: the shared legacy pair plus the
+/// per-home accounts, which are found by their reserved name prefixes.
+fn managed_user_names() -> Result<Vec<String>> {
+    let mut names = vec![OFFLINE_USERNAME.to_string(), ONLINE_USERNAME.to_string()];
+    names.extend(
+        enumerate_local_names(LocalPrincipal::User)?
+            .into_iter()
+            .filter(|name| account_names::tag_of_derived_account(name).is_some()),
+    );
+    Ok(names)
+}
+
+/// The shared legacy group plus every per-home group.
+pub(super) fn managed_group_names() -> Result<Vec<String>> {
+    let mut names = vec![SANDBOX_USERS_GROUP.to_string()];
+    names.extend(
+        enumerate_local_names(LocalPrincipal::Group)?
+            .into_iter()
+            .filter(|name| account_names::is_derived_group(name)),
+    );
+    Ok(names)
+}
+
+#[derive(Clone, Copy)]
+enum LocalPrincipal {
+    User,
+    Group,
+}
+
+fn enumerate_local_names(kind: LocalPrincipal) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut user_resume = 0_u32;
+    let mut group_resume = 0_usize;
+    loop {
+        let mut buffer: *mut u8 = std::ptr::null_mut();
+        let mut read = 0_u32;
+        let mut total = 0_u32;
+        let status = unsafe {
+            match kind {
+                LocalPrincipal::User => network::NetUserEnum(
+                    null(),
+                    /*level*/ 0,
+                    network::FILTER_NORMAL_ACCOUNT,
+                    &mut buffer,
+                    network::MAX_PREFERRED_LENGTH,
+                    &mut read,
+                    &mut total,
+                    &mut user_resume,
+                ),
+                LocalPrincipal::Group => network::NetLocalGroupEnum(
+                    null(),
+                    /*level*/ 0,
+                    &mut buffer,
+                    network::MAX_PREFERRED_LENGTH,
+                    &mut read,
+                    &mut total,
+                    &mut group_resume,
+                ),
+            }
+        };
+        if status != network::NERR_Success && status != ERROR_MORE_DATA {
+            if !buffer.is_null() {
+                unsafe { network::NetApiBufferFree(buffer.cast()) };
+            }
+            bail!("enumerate local sandbox principals: {status}");
+        }
+        for index in 0..read as usize {
+            let name = unsafe {
+                match kind {
+                    LocalPrincipal::User => {
+                        (*buffer.cast::<network::USER_INFO_0>().add(index)).usri0_name
+                    }
+                    LocalPrincipal::Group => {
+                        (*buffer.cast::<network::LOCALGROUP_INFO_0>().add(index)).lgrpi0_name
+                    }
+                }
+            };
+            names.push(wide_ptr_to_string(name));
+        }
+        if !buffer.is_null() {
+            unsafe { network::NetApiBufferFree(buffer.cast()) };
+        }
+        if status != ERROR_MORE_DATA {
+            return Ok(names);
+        }
+    }
+}
+
+fn wide_ptr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut length = 0;
+    while unsafe { *ptr.add(length) } != 0 {
+        length += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, length) })
 }
 
 #[cfg(test)]

@@ -156,12 +156,22 @@ impl PreparedWindowsSandboxCleanup {
             errors.push(format!("{error:#}"));
         }
 
+        let tags = self.users.derived_tags();
+        let mut hidden_users = vec![OFFLINE_USERNAME, ONLINE_USERNAME];
+        for name in self.users.names() {
+            if !hidden_users.contains(&name) {
+                hidden_users.push(name);
+            }
+        }
         for (operation, result) in [
-            ("remove WFP filters", crate::wfp::remove_wfp_filters()),
-            ("remove firewall rules", firewall::cleanup_firewall_rules()),
+            ("remove WFP filters", crate::wfp::remove_wfp_filters(&tags)),
+            (
+                "remove firewall rules",
+                firewall::cleanup_firewall_rules(&tags),
+            ),
             (
                 "remove hidden-user entries",
-                crate::hide_users::unhide_sandbox_users(&[OFFLINE_USERNAME, ONLINE_USERNAME]),
+                crate::hide_users::unhide_sandbox_users(&hidden_users),
             ),
         ] {
             match result {
@@ -184,7 +194,11 @@ impl PreparedWindowsSandboxCleanup {
                 .sids()
                 .any(|sid| self._retained_logons.contains_sid(sid))
         {
-            match principals::remove_sandbox_principal("CodexSandboxUsers") {
+            match principals::managed_group_names().and_then(|groups| {
+                groups
+                    .iter()
+                    .try_for_each(|group| principals::remove_sandbox_principal(group))
+            }) {
                 Ok(()) => report("remove sandbox group: completed"),
                 Err(error) => {
                     report(&format!("remove sandbox group: failed, {error:#}"));

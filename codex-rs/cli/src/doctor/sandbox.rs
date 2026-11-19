@@ -189,10 +189,9 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
                     .details
                     .push("sandbox provisioning: complete".to_string());
 
-                for username in [
-                    codex_windows_sandbox::OFFLINE_USERNAME,
-                    codex_windows_sandbox::ONLINE_USERNAME,
-                ] {
+                let (offline_username, online_username) =
+                    codex_windows_sandbox::sandbox_account_usernames(home);
+                for username in [offline_username.as_str(), online_username.as_str()] {
                     let username_wide = username.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
                     let mut buffer = std::ptr::null_mut();
                     let status = unsafe {

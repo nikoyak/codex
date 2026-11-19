@@ -224,10 +224,15 @@ pub fn set_local_user_flags(name: &str, flags: u32) -> Result<()> {
 }
 
 pub fn ensure_sandbox_users_group() -> Result<Vec<u8>> {
+    ensure_local_group(SANDBOX_USERS_GROUP)
+}
+
+/// Creates the named managed local group if needed and returns its SID.
+pub(crate) fn ensure_local_group(group: &str) -> Result<Vec<u8>> {
     const ERROR_ALIAS_EXISTS: u32 = 1379;
     const NERR_GROUP_EXISTS: u32 = 2223;
 
-    let name = to_wide(SANDBOX_USERS_GROUP);
+    let name = to_wide(group);
     let comment = to_wide(SANDBOX_USERS_GROUP_COMMENT);
     let info = LOCALGROUP_INFO_1 {
         lgrpi1_name: name.as_ptr() as *mut u16,
@@ -244,11 +249,11 @@ pub fn ensure_sandbox_users_group() -> Result<Vec<u8>> {
     };
     if status != NERR_Success && status != ERROR_ALIAS_EXISTS && status != NERR_GROUP_EXISTS {
         return Err(anyhow::anyhow!(
-            "NetLocalGroupAdd failed for {SANDBOX_USERS_GROUP} code {status} parm_err={parameter_error}"
+            "NetLocalGroupAdd failed for {group} code {status} parm_err={parameter_error}"
         ));
     }
 
-    resolve_sid(SANDBOX_USERS_GROUP)
+    resolve_sid(group)
 }
 
 pub fn resolve_sid(name: &str) -> Result<Vec<u8>> {

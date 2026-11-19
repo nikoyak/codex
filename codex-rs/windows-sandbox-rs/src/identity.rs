@@ -1,12 +1,11 @@
 use crate::SandboxRuntimeAccount;
+use crate::account_names::SandboxAccountNames;
 use crate::WindowsSandboxProvisioningOutcome;
 use crate::WindowsSandboxProvisioningSettings;
 use crate::WindowsSandboxProxyListeners;
 use crate::dpapi;
 use crate::logging::debug_log;
 use crate::resolved_permissions::ResolvedWindowsSandboxPermissions;
-use crate::setup::OFFLINE_USERNAME;
-use crate::setup::ONLINE_USERNAME;
 use crate::setup::OfflineProxySettings;
 use crate::setup::SandboxNetworkIdentity;
 use crate::setup::SandboxSetupRequest;
@@ -240,6 +239,40 @@ fn account_logon_error(error: io::Error) -> anyhow::Error {
     }
 }
 
+/// Account names recorded for `codex_home`, or the names a fresh setup would create.
+///
+/// Recorded names are re-validated because the files live in an owner-controlled
+/// directory; anything that is not the legacy pair or a well-formed derived pair
+/// is ignored.
+pub(crate) fn resolve_account_names(codex_home: &Path) -> SandboxAccountNames {
+    if let Ok(Some(users)) = load_users(codex_home) {
+        if users.version_matches() {
+            if let Some(names) =
+                SandboxAccountNames::from_recorded(&users.offline.username, &users.online.username)
+            {
+                return names;
+            }
+        }
+    }
+    if let Ok(Some(marker)) = load_marker(codex_home) {
+        if marker.version_matches() {
+            if let Some(names) = SandboxAccountNames::from_recorded(
+                &marker.offline_username,
+                &marker.online_username,
+            ) {
+                return names;
+            }
+        }
+    }
+    SandboxAccountNames::derived(codex_home)
+}
+
+/// `(offline, online)` sandbox account names that apply to `codex_home`.
+pub fn sandbox_account_usernames(codex_home: &Path) -> (String, String) {
+    let names = resolve_account_names(codex_home);
+    (names.offline, names.online)
+}
+
 fn select_identity(
     network_identity: SandboxNetworkIdentity,
     codex_home: &Path,
@@ -379,7 +412,8 @@ fn require_sandbox_account_with_setup(
         // Cleanup may also have removed the group, so repair missing or disabled accounts before ACL
         // refresh can fail. Expired passwords also require full setup, since an ACL refresh
         // cannot rotate the account passwords and update the stored DPAPI credentials.
-        for username in [OFFLINE_USERNAME, ONLINE_USERNAME] {
+        let names = resolve_account_names(codex_home);
+        for username in [names.offline.as_str(), names.online.as_str()] {
             let needs_repair = match read_local_user_flags(username) {
                 Ok(Some(flags)) => flags & (UF_ACCOUNTDISABLE | UF_PASSWORD_EXPIRED) != 0,
                 Ok(None) => true,
@@ -424,7 +458,9 @@ fn require_sandbox_account_with_setup(
             !registration_required(codex_home),
             "protected Core setup did not publish ready runtime ownership"
         );
-        for username in [OFFLINE_USERNAME, ONLINE_USERNAME] {
+        // A full setup moves the home onto its own accounts, so re-read the recorded names.
+        let names = resolve_account_names(codex_home);
+        for username in [names.offline.as_str(), names.online.as_str()] {
             if let Ok(Some(flags)) = read_local_user_flags(username) {
                 anyhow::ensure!(
                     flags & UF_PASSWORD_EXPIRED == 0,
@@ -527,14 +563,52 @@ pub(crate) fn refresh_logon_sandbox_creds(
 mod tests {
     use super::desired_offline_proxy_settings;
     use super::remove_sandbox_users_file;
+    use super::resolve_account_names;
     use crate::WindowsSandboxProxySettingsMode;
+    use crate::account_names::SandboxAccountNames;
     use crate::setup::SandboxNetworkIdentity;
+    use crate::setup::SandboxUserRecord;
+    use crate::setup::SandboxUsersFile;
     use crate::setup::SetupMarker;
     use crate::setup::sandbox_users_path;
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
+
+    fn write_users(codex_home: &std::path::Path, offline: &str, online: &str) {
+        let record = |username: &str| SandboxUserRecord {
+            username: username.to_string(),
+            password: String::new(),
+        };
+        let users = SandboxUsersFile {
+            version: crate::setup::SETUP_VERSION,
+            offline: record(offline),
+            online: record(online),
+        };
+        let path = sandbox_users_path(codex_home);
+        fs::create_dir_all(path.parent().expect("sandbox secrets dir")).expect("create dir");
+        fs::write(path, serde_json::to_vec(&users).expect("serialize")).expect("write users");
+    }
+
+    #[test]
+    fn resolve_account_names_uses_recorded_pair_and_rejects_unmanaged_names() {
+        let home = TempDir::new().expect("tempdir");
+        let derived = SandboxAccountNames::derived(home.path());
+        assert_eq!(resolve_account_names(home.path()), derived);
+
+        write_users(home.path(), "CodexSandboxOffline", "CodexSandboxOnline");
+        assert_eq!(
+            resolve_account_names(home.path()),
+            SandboxAccountNames::legacy()
+        );
+
+        write_users(home.path(), &derived.offline, &derived.online);
+        assert_eq!(resolve_account_names(home.path()), derived);
+
+        write_users(home.path(), "Administrator", "CodexSandboxOnline");
+        assert_eq!(resolve_account_names(home.path()), derived);
+    }
 
     #[test]
     fn remove_sandbox_users_file_deletes_existing_file() {

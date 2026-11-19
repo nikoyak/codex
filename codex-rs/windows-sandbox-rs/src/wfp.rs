@@ -8,6 +8,7 @@ use std::ptr::null;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::FWP_E_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_IN_USE;
 use windows_sys::Win32::Foundation::FWP_E_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND;
@@ -88,10 +89,13 @@ pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
     ensure_sublayer(engine.handle)?;
 
     let user_condition = UserMatchCondition::for_account(account)?;
+    // Filters are keyed by GUID and replaced in place, so each offline account needs its own
+    // keys; otherwise installing for one home would retarget another home's filters.
+    let tag = crate::account_names::resource_tag_for_offline_username(account);
     let mut installed_filter_count = 0;
     for spec in FILTER_SPECS {
-        delete_filter_if_present(engine.handle, &spec.key)?;
-        add_filter(engine.handle, spec, &user_condition)?;
+        delete_filter_if_present(engine.handle, &scoped_filter_key(spec.key, tag))?;
+        add_filter(engine.handle, spec, &user_condition, tag)?;
         installed_filter_count += 1;
     }
 
@@ -99,12 +103,17 @@ pub fn install_wfp_filters_for_account(account: &str) -> Result<usize> {
     Ok(installed_filter_count)
 }
 
-pub(crate) fn remove_wfp_filters() -> Result<()> {
+/// Removes the legacy filters and the filters namespaced by each per-home account tag.
+pub(crate) fn remove_wfp_filters(tags: &[String]) -> Result<()> {
     // Leave time for other cleanup if a WFP policy writer holds the transaction lock.
     let engine = Engine::open(/*transaction_wait_timeout_ms*/ 1_000)?;
     let mut transaction = engine.begin_transaction()?;
     for spec in FILTER_SPECS {
         delete_filter_if_present(engine.handle, &spec.key)?;
+        for tag in tags {
+            let key = scoped_filter_key(spec.key, Some(tag.as_str()));
+            delete_filter_if_present(engine.handle, &key)?;
+        }
     }
     for (result, operation, missing) in [
         (
@@ -118,7 +127,12 @@ pub(crate) fn remove_wfp_filters() -> Result<()> {
             FWP_E_PROVIDER_NOT_FOUND as u32,
         ),
     ] {
-        ensure_success_or(result, operation, &[missing, FWP_E_NOT_FOUND as u32])?;
+        // Filters of accounts removed outside uninstall can still reference the shared provider.
+        ensure_success_or(
+            result,
+            operation,
+            &[missing, FWP_E_NOT_FOUND as u32, FWP_E_IN_USE as u32],
+        )?;
     }
     transaction.commit()
 }
@@ -292,18 +306,34 @@ fn ensure_sublayer(engine: HANDLE) -> Result<()> {
     ensure_success_or(result, "FwpmSubLayerAdd0", &[FWP_E_ALREADY_EXISTS as u32])
 }
 
+/// Derives the filter key for one offline account. The legacy account (`None`) keeps the
+/// original key.
+fn scoped_filter_key(key: GUID, tag: Option<&str>) -> GUID {
+    let Some(tag) = tag.and_then(|tag| u32::from_str_radix(tag, 16).ok()) else {
+        return key;
+    };
+    let value = (u128::from(key.data1) << 96)
+        | (u128::from(key.data2) << 80)
+        | (u128::from(key.data3) << 64)
+        | u128::from(u64::from_be_bytes(key.data4));
+    let tag = u128::from(tag);
+    GUID::from_u128(value ^ (tag | (tag << 32)))
+}
+
 /// Adds one blocking WFP filter from the static filter spec list.
 fn add_filter(
     engine: HANDLE,
     spec: &FilterSpec,
     user_condition: &UserMatchCondition,
+    tag: Option<&str>,
 ) -> Result<()> {
-    let filter_name = to_wide(OsStr::new(spec.name));
+    let scoped_name = crate::account_names::scoped_rule_name(spec.name, tag);
+    let filter_name = to_wide(OsStr::new(&scoped_name));
     let filter_description = to_wide(OsStr::new(spec.description));
     let mut filter_conditions = build_conditions(spec.conditions, user_condition);
     let provider_key = PROVIDER_KEY;
     let filter = FWPM_FILTER0 {
-        filterKey: spec.key,
+        filterKey: scoped_filter_key(spec.key, tag),
         displayData: FWPM_DISPLAY_DATA0 {
             name: filter_name.as_ptr() as *mut _,
             description: filter_description.as_ptr() as *mut _,
@@ -330,7 +360,7 @@ fn add_filter(
 
     let mut filter_id = 0_u64;
     let result = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
-    ensure_success(result, &format!("FwpmFilterAdd0({})", spec.name))
+    ensure_success(result, &format!("FwpmFilterAdd0({scoped_name})"))
 }
 
 /// Converts our compact condition specs into WFP filter conditions.

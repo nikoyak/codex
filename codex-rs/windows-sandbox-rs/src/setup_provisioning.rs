@@ -711,7 +711,7 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
         }
     };
     log_line(log, "read-acl-only mode: applying read ACLs")?;
-    let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&sandbox_group_name(payload))?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
     let mut refresh_errors: Vec<String> = Vec::new();
     if !payload.read_roots.is_empty() {
@@ -840,8 +840,11 @@ fn configure_offline_sandbox_network(
     offline_sid_str: &str,
     log: &mut dyn Write,
 ) -> Result<()> {
+    let rule_tag =
+        crate::account_names::resource_tag_for_offline_username(&payload.offline_username);
     let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
         offline_sid_str,
+        rule_tag,
         &payload.proxy_ports,
         payload.allow_local_binding,
         log,
@@ -855,7 +858,7 @@ fn configure_offline_sandbox_network(
             format!("ensure offline proxy allowlist failed: {err}"),
         )));
     }
-    let firewall_result = firewall::ensure_offline_network_blocks(offline_sid_str, log);
+    let firewall_result = firewall::ensure_offline_network_blocks(offline_sid_str, rule_tag, log);
     if let Err(err) = firewall_result {
         if extract_setup_failure(&err).is_some() {
             return Err(err);
@@ -956,10 +959,14 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
     })
 }
 
+fn sandbox_group_name(payload: &Payload) -> String {
+    crate::account_names::group_name_for_offline_username(&payload.offline_username)
+}
+
 fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
     provision_sandbox(payload, log, sbx_dir)?;
 
-    let sandbox_group_sid = resolve_sandbox_users_group_sid().map_err(|err| {
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&sandbox_group_name(payload)).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
             format!("resolve sandbox users group SID failed: {err}"),
@@ -978,7 +985,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
         provision_sandbox(payload, log, sbx_dir)?;
     }
 
-    let sandbox_group_sid = resolve_sandbox_users_group_sid().map_err(|err| {
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&sandbox_group_name(payload)).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
             format!("resolve sandbox users group SID failed: {err}"),
